@@ -2,17 +2,21 @@
 
 ## Overview
 
-Argus Intelligence is a Kenyan license plate detection and recognition system with face recognition, watchlist alerting, and a 4-engine ensemble OCR pipeline. It runs as a Streamlit web application and processes both still images and video footage.
+Argus Intelligence is a Kenyan license plate detection and recognition system built for real-world traffic scenes. It runs as a Streamlit web application and supports still image analysis, video file analysis, YouTube video input, and RTSP/IP camera streams. The system combines a deep-learning plate detector, a 3-engine ensemble OCR pipeline, face recognition, and a watchlist alert system — all persisted to a local SQLite database.
 
 ---
 
 ## Architecture
 
 ```
-app.py          — Streamlit UI + all detection logic
-db.py           — SQLite persistence (detections + watchlist)
-util.py         — Kenyan plate format correction + deduplication
-face_utils.py   — Face detection (Haar) + LBPH recognition
+app.py              — Streamlit UI + full detection pipeline
+db.py               — SQLite persistence (detections, watchlist, face data)
+util.py             — Kenyan plate format validation, correction, deduplication
+face_utils.py       — Haar face detection + LBPH recognition
+llm_verifier.py     — (retained, not active in pipeline)
+build_training_set.py     — Export confirmed plate crops as a labelled training set
+collect_annotations.py    — Collect real video frames with YOLO pre-annotations
+plates_training/          — Synthetic data generator + fine-tuning notebook
 ```
 
 ---
@@ -20,95 +24,116 @@ face_utils.py   — Face detection (Haar) + LBPH recognition
 ## Detection Pipeline
 
 ### 1. Vehicle Detection
-Model: **YOLOv11s** (`yolo11s.pt`, COCO-trained)
-Detects vehicles in the frame and classifies them as Car, Motorcycle, Bus, or Truck. Each detected plate is then associated with the nearest vehicle by Euclidean distance between centroids.
 
-### 2. License Plate Detection
-Model: **yolo-v9-t-640-license-plate-end2end** (ONNX, via fast-alpr)
-Runs CoreML execution provider on Apple Silicon for accelerated inference. Outputs bounding boxes for plate regions. Each crop is padded by 8 pixels before being passed to OCR.
+Model: **YOLOv8n** (`yolov8n.pt`, COCO-trained)
+Detects cars, motorcycles, buses, and trucks. Bounding boxes are stored per frame.
 
-### 3. Image Preprocessing (per crop)
-Before OCR, every plate crop goes through:
-- **Blur detection** — Laplacian variance check. If below adaptive threshold, EDSR deblur runs first.
-- **EDSR super-resolution** — EDSR-base x2 (eugenesiow/edsr-base via super-image). Upscales blurry crops 2× before OCR. Only triggers on crops that fail the sharpness test.
-- **Upscaling** — Bicubic resize to at least 200×60px (minimum 2× scale).
-- **Deskew** — MinAreaRect-based rotation correction (1°–15° range).
-- **CLAHE** — Contrast-limited adaptive histogram equalization (clipLimit 2.0, 4×4 tiles).
-- **Bilateral filter** — Edge-preserving noise reduction (d=9, σ=75).
+**Spatial gate:** Every plate detection is checked against vehicle bounding boxes. The plate center must fall within at least one vehicle bbox expanded by ±80px. Plates detected outside all vehicle regions are discarded before OCR runs. If no vehicles are detected in a frame the gate is bypassed.
 
-### 4. Ensemble OCR (4 engines)
+### 2. Plate Detection
 
-Every plate crop is read by all four engines independently:
+Model: **yolo-v9-t-640-license-plate-end2end** (ONNX via fast-alpr)
+Runs ONNX Runtime (CoreML on Apple Silicon). Outputs plate bounding boxes. Each crop is padded by 8px before passing to OCR.
 
-| Engine | Model / Config | Strength |
-|--------|---------------|----------|
-| **fast-alpr** | cct-xs-v2-global-model (ONNX) | Fast, purpose-built for plates |
-| **PaddleOCR** | PP-OCRv4 with angle classifier | Strong on rotated/angled text |
-| **EasyOCR** | CRAFT + CRNN (en) | Robust on low-res crops |
-| **Tesseract** | v5.5.2, PSM 7, LSTM + legacy OEM 3 | Strict whitelist `A-Z0-9`, single-line mode |
+### 3. Plate Preprocessing (per crop)
 
-Each engine's raw text is passed through `process_alpr_text()` (util.py) which applies Kenyan-format positional correction:
-- Status `valid` — exact match, no changes
-- Status `corrected` — 1–2 character fixes (e.g. `0→O`, `1→I`)
-- Status `guessed` — 3+ fixes or sliding-window match, confidence penalised
-- Status `rejected` — no valid Kenyan plate producible
+Before OCR every plate crop is:
+- **Upscaled** — bicubic resize to at least 200px wide (minimum 2× scale)
+- **Deskewed** — MinAreaRect rotation correction (1°–15° range)
+- **CLAHE** — contrast-limited adaptive histogram equalisation (clipLimit 2.0, 4×4 tiles)
+- **Bilateral filter** — edge-preserving noise reduction (d=9, σ=75)
+
+### 4. Ensemble OCR (3 engines)
+
+| Engine | Model | Weight | Strength |
+|--------|-------|--------|----------|
+| **Fast-Plate-OCR** | cct-s-v2-global-model | 1.5 | Transformer, per-char confidence, primary engine |
+| **PaddleOCR** | PP-OCRv4 + angle classifier | 1.2 | Strong on rotated/angled text |
+| **fast-alpr CCT** | cct-xs-v2-global-model | 0.8 | Fast, plate-specific |
+
+Each engine's raw text is passed through `process_alpr_text()` (util.py) for Kenyan-format positional correction:
+
+| Status | Meaning |
+|--------|---------|
+| `valid` | Exact Kenyan plate match, no corrections |
+| `corrected` | 1–2 character fixes (e.g. `0↔O`, `1↔I`, `S↔5`) |
+| `guessed` | 3+ fixes or sliding-window match; confidence penalised |
+| `rejected` | No valid Kenyan plate producible |
+
+**Fast-path:** If fast-alpr returns conf ≥ 0.90 with status `valid` and a clean series, the other engines are skipped entirely.
 
 **Voting logic:**
-1. All engines ranked by status (`valid > corrected > guessed > rejected`), then confidence.
-2. If ≥2 engines reach the same top status, `vote_plate()` runs character-level majority voting across their results.
-3. The voted consensus goes through format correction one final time.
-4. Result: single best plate text + confidence.
+1. Engines ranked by status (`valid > corrected > guessed > rejected`), then confidence.
+2. If ≥2 engines produce the same top status, `vote_plate()` runs character-level majority voting.
+3. Voted consensus goes through format correction one final time.
+4. Plates below 40% combined confidence are hidden from the dashboard.
 
-### 5. Kenyan Plate Format
-Format: `K[A-Z]{2} \d{3}[A-Z]` — e.g. `KDA 123B`, `KBZ 456Y`
+### 5. Kenyan Plate Formats
 
-Positional correction maps:
-- Letter positions (0,1,2,6): digits corrected to visually similar letters (`0→O`, `1→I`, `8→B`, etc.)
-- Digit positions (3,4,5): letters corrected to visually similar digits (`O→0`, `I→1`, `B→8`, etc.)
+| Type | Format | Example |
+|------|--------|---------|
+| Civilian | `K[A-Z]{2} \d{3}[A-Z]` | `KDA 123B` |
+| Tuk-tuk | `KT[A-Z]{2} \d{3}[A-Z]` | `KTWA 123B` |
+| Motorcycle | `KMC[A-Z] \d{3}[A-Z]` | `KMCA 123B` |
+
+Positional OCR correction maps:
+- Letter positions: digits corrected to visually similar letters (`0→O`, `1→I`, `8→B`, `6→G`)
+- Digit positions: letters corrected to visually similar digits (`O→0`, `I→1`, `B→8`, `G→6`)
 
 ### 6. Video Frame Sampling
+
 - Samples one frame per second (step = round(FPS)).
-- Adaptive sharpness threshold: samples first 30 target frames, sets threshold at 35% of median Laplacian variance. Blurry frames are skipped.
-- Deduplication via `PlateDeduplicator`: fuzzy matching (SequenceMatcher ≥0.82 similarity), 30-second cooldown per plate, 120-second re-entry window. Same plate reappearing after 120s is logged as a new visit.
-- Post-processing voting pass: after all frames are processed, each saved plate's text is replaced by the character-voted consensus from all its OCR variants.
+- **Adaptive sharpness:** samples first 30 target frames, sets threshold at 35% of median Laplacian variance. Blurry frames skipped.
+- **Deduplication** via `PlateDeduplicator`: fuzzy match (SequenceMatcher ≥0.82), 30s cooldown per plate, 120s re-entry window. Same plate after 120s logged as new visit.
+
+---
+
+## Video Sources
+
+| Source | How it works |
+|--------|-------------|
+| File Upload | Upload MP4/MOV/AVI/MKV up to 1 GB |
+| YouTube URL | yt-dlp downloads best MP4 ≤720p to temp file; full seek/frame-skip pipeline runs normally |
+| RTSP / IP Camera | cv2.VideoCapture accepts RTSP URLs directly; optional continuous live feed mode |
 
 ---
 
 ## OCR Ensemble Vote Board
 
-Every detection renders a live vote board showing:
-- The raw plate crop photo (base64-embedded JPEG)
-- Each engine's result, normalised status, and confidence
-- Which engine(s) were selected or went into the vote
-- If voting triggered: which plates were compared and the consensus character-by-character result
-- Yellow `VOTED` badge in the panel header when character voting fired
+After analysis, each detected plate has a collapsible **🔍 OCR Ensemble** expander showing:
+- Plate crop image (rendered via `st.image()`)
+- Each engine's result, corrected status, confidence, and latency
+- Which engine(s) were selected or contributed to the vote
+- Character-level vote breakdown when voting triggered
+- Per-character confidence heatmap (green ≥90%, yellow ≥70%, red <70%)
 
-During video analysis the vote board appears inline in the live detection feed whenever a vote occurs.
+Vote panels are hidden during live video processing and shown after analysis completes.
 
 ---
 
 ## Persistence — SQLite Backend
 
-Database: `csv_detections/argus.db`
+Database: `data/argus.db`
 
-Tables:
-- **detections** — timestamp, source (image/video), vehicle_type, plate_text, ocr_confidence, status, image_file
-- **watchlist** — plate_text (unique), label, added_at
+| Table | Contents |
+|-------|----------|
+| `detections` | timestamp, source, vehicle_type, plate_text, ocr_confidence, status, image_file |
+| `watchlist` | plate_text (unique), label, added_at |
+| `series_registry` | Known Kenyan plate series for validation |
 
-Indices on `plate_text`, `timestamp`, and `source` for fast filtered queries.
-
-Plate crop images are saved to `licenses_plates_imgs_detected/` as JPEG files (preprocessed version).
+Plate crop images saved to `plate_crops/` as JPEG (upscaled, colour).
 
 ---
 
 ## Watchlist / Alert System
 
-Plates can be added to the watchlist via the sidebar with an optional label (e.g. "Stolen vehicle").
+Add any plate to the watchlist via the sidebar with an optional label (e.g. "Stolen").
 
-On every detection — image or video — `insert_detections()` cross-references all detected plates against the watchlist. Hits are returned immediately and displayed as:
-- Red alert banner at the top of the results section
-- Plate badge turns red (`plate-badge-alert` styling) in the results grid
-- Watchlist tab shows full detection history for every monitored plate
+On every detection `insert_detections()` cross-references all results against the watchlist. Hits trigger:
+- Red alert banner at the top of results
+- Red plate badge (`plate-badge-alert`) in the results grid
+- Optional webhook fire to a configured endpoint
+- Watchlist tab shows full detection history per monitored plate
 
 ---
 
@@ -117,35 +142,66 @@ On every detection — image or video — `insert_detections()` cross-references
 Engine: **OpenCV LBPH** (Local Binary Pattern Histogram)
 Detection: Haar cascade (`haarcascade_frontalface_default.xml`)
 
-Training: Upload ≥5 frontal images per subject via the Face Training tab. The system extracts face crops (100×100 grayscale), trains the LBPH model, and saves it to `models/face_model.yml`.
+Training: Upload ≥5 frontal images per subject via Face Training tab. System extracts 100×100 grayscale crops, trains LBPH, saves to `models/face_model.yml`.
 
-Recognition runs on every analysed image. Recognised faces are drawn with a green bounding box and name label; unknown faces get an orange box. Recognised names are listed below the detection results.
-
-Confidence threshold: distance < 80 (LBPH distance metric, lower = more similar).
+Recognition runs on every analysed image/frame. Recognised faces: green box + name. Unknown: orange box. Confidence threshold: LBPH distance < 80.
 
 ---
 
 ## User Interface
 
-Framework: **Streamlit** with custom CSS (Inter font, light theme)
+Framework: **Streamlit**, custom CSS (Inter font, light theme)
 
 **Tabs:**
-- **Image Analysis** — upload image, view annotated result, plate crops, vote boards
-- **Video Analysis** — upload video, live frame view with bounding boxes, live detection feed, post-analysis vote boards
-- **Detection Log** — filterable/searchable table of all detections with CSV export
-- **Watchlist** — full watchlist management + detection history per monitored plate
-- **Face Training** — enrol subjects, view enrolled persons
+
+| Tab | Purpose |
+|-----|---------|
+| 📷 Image Analysis | Upload image, annotated result, plate crops, vote expanders |
+| 🎬 Video Analysis | File / YouTube / RTSP input, live frame view, live detection table, post-run vote expanders |
+| 📋 Detection Log | Filterable/searchable history with CSV export, per-plate crop viewer |
+| 🔍 Rejection Audit | Review plates that were detected but rejected, with crop and reason |
+| 🚨 Watchlist | Manage monitored plates, detection history per plate |
+| 👤 Face Training | Enrol subjects, view enrolled persons, retrain model |
+| 📊 Analytics | Detection volume over time, vehicle type breakdown, top plates chart |
 
 **Sidebar:**
 - Detection confidence slider (0.10–0.95)
-- Live statistics (saved / auto-fixed / guessed / rejected counts)
-- Watchlist manager (add plate + label, remove individual entries)
+- Live counters (saved / corrected / guessed / rejected)
+- Watchlist manager (add plate + label, remove entries)
 - Clear All Detections button
 
 **Live video annotations:**
-Vehicle bounding boxes drawn in blue with class label. Plate bounding boxes drawn in green (saved) or orange (rejected). Plate text floats above each box as an overlay label.
+Vehicle bounding boxes in blue with class label. Plate bounding boxes in green (saved) or orange (rejected/unverified). Plate text floats above each box.
 
-**Persistent log box** at the bottom of every page — shows most recent 200 detections with search/filter and download.
+---
+
+## Training Data Tools
+
+### `collect_annotations.py`
+Extracts frames from any dashcam/traffic video, runs the fast-alpr ONNX detector as a pre-annotator, and saves YOLO-format labels to `data/real_annotations/`. Output is ready to upload to Roboflow or Label Studio for human verification before fine-tuning.
+
+```bash
+python3 collect_annotations.py video.mp4 [--conf 0.25] [--every 10] [--limit 400]
+```
+
+### `build_training_set.py`
+Pulls high-confidence SAVED/CORRECTED plate crops from the database, cross-references with a local Ollama LLM (llava-phi3) for blind verification, and exports agreed crops + labels to a training CSV.
+
+```bash
+python3 build_training_set.py [--conf 0.85] [--out training_data] [--limit 500]
+```
+
+### `plates_training/generate_synthetic_plates.py`
+Generates 1500 synthetic Kenyan plate scenes (640×640) for YOLO fine-tuning. Features:
+- Gradient backgrounds with distraction rectangles
+- Yellow plate color jitter per image
+- Shadow, perspective warp, blur, mud augmentation
+- All three plate classes (car / tuk-tuk / motorcycle), 60/20/20 split
+- Auto train/val split + `data.yaml`
+
+```bash
+python3 plates_training/generate_synthetic_plates.py
+```
 
 ---
 
@@ -162,49 +218,56 @@ textColor = "#1E293B"
 font = "sans serif"
 
 [server]
-maxUploadSize = 500
+maxUploadSize = 1024
 ```
 
-Max upload: 500 MB (supports large video files).
-
----
-
-## Dependencies
-
-```
-streamlit>=1.35.0          — UI framework
-ultralytics>=8.0.0         — YOLOv11 vehicle detection
-fast-alpr>=0.4.0           — ONNX plate detection + OCR engine 1
-onnxruntime>=1.18.0        — ONNX inference (CoreML on Apple Silicon)
-paddlepaddle>=3.0.0        — PaddleOCR backend
-paddleocr>=3.0.0           — OCR engine 2
-easyocr>=1.7.0             — OCR engine 3
-pytesseract>=0.3.10        — OCR engine 4 (requires tesseract binary)
-super-image>=0.2.0         — EDSR deblur model
-torch>=2.0.0               — PyTorch (EDSR inference)
-opencv-contrib-python>=4.9.0  — Image processing + face recognition
-Pillow>=10.0.0             — Image I/O
-numpy>=1.24.0              — Array operations
-pandas>=2.0.0              — Tabular data
-```
-
-External binary: `tesseract` v5+ (installed via `brew install tesseract` on macOS).
+Max upload: **1 GB**.
 
 ---
 
 ## Running the App
 
 ```bash
-venv/bin/python3 -m streamlit run app.py --server.port 8501
+# Activate venv
+source venv/bin/activate
+
+# Run
+streamlit run app.py --server.port 8501
 ```
+
+---
+
+## Dependencies
+
+See `requirements.txt` for pinned versions. Core packages:
+
+| Package | Purpose |
+|---------|---------|
+| `streamlit` | UI framework |
+| `ultralytics` | YOLOv8 vehicle detection |
+| `fast-alpr` | ONNX plate detector + CCT OCR engine |
+| `fast-plate-ocr` | Primary Transformer OCR engine |
+| `paddleocr` / `paddlepaddle` | Secondary OCR engine |
+| `onnxruntime` | ONNX inference runtime |
+| `opencv-contrib-python` | Image processing + face recognition |
+| `torch` / `torchvision` | PyTorch backend |
+| `yt-dlp` | YouTube video download |
+| `plotly` | Analytics charts |
+| `fpdf2` | PDF incident report export |
+| `fastapi` / `uvicorn` | REST API (`api.py`) |
 
 ---
 
 ## Source Files
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `app.py` | 1195 | Main application — UI, detection pipeline, ensemble OCR, vote board |
-| `db.py` | 184 | SQLite backend — detections table, watchlist table, query helpers |
-| `util.py` | 303 | Kenyan plate correction, `PlateDeduplicator`, `vote_plate` |
-| `face_utils.py` | 127 | Haar face detection, LBPH training and recognition |
+| File | Purpose |
+|------|---------|
+| `app.py` | Main application — UI, pipeline, ensemble OCR, vote board |
+| `db.py` | SQLite backend — detections, watchlist, query helpers |
+| `util.py` | Kenyan plate correction, `PlateDeduplicator`, `vote_plate` |
+| `face_utils.py` | Haar detection, LBPH training and recognition |
+| `api.py` | FastAPI REST endpoints for headless integration |
+| `report.py` | PDF incident report generator |
+| `collect_annotations.py` | Real frame collection with pre-annotations |
+| `build_training_set.py` | LLM-verified training set exporter |
+| `plates_training/generate_synthetic_plates.py` | Synthetic scene generator |
