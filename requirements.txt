@@ -1,0 +1,33 @@
+# Core UI
+streamlit>=1.37.0
+
+# Vehicle & plate detection
+ultralytics>=8.0.0
+fast-alpr>=0.4.0
+onnxruntime>=1.18.0
+
+# OCR engines
+paddlepaddle>=3.0.0
+paddleocr>=3.0.0
+
+# Image processing / deblur
+opencv-contrib-python>=4.9.0
+super-image>=0.2.0
+torch>=2.0.0
+Pillow>=10.0.0
+
+# Utilities
+numpy>=1.24.0
+pandas>=2.0.0
+requests>=2.28.0
+
+# Analytics
+plotly>=5.0.0
+
+# PDF reports
+fpdf2>=2.7.0
+
+# REST API
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pydantic>=2.0.0

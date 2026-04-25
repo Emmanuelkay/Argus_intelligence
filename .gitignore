@@ -1,0 +1,37 @@
+# Runtime data — generated, not source
+plate_crops/
+face_data/
+data/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Images — no plate or face photos in repo
+*.jpg
+*.jpeg
+*.gif
+# Keep UI screenshots in assets/, exclude test images
+assets/plate_test.jpg
+assets/test_background.jpg
+
+# Model weights — too large for git
+models/
+*.pt
+*.onnx
+*.yml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+*.egg-info/
+
+# OS / IDE
+.DS_Store
+.streamlit/secrets.toml
+*.dmg
