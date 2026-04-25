@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 import os, re, tempfile, uuid, subprocess, time
-import concurrent.futures
 from datetime import datetime
 from pathlib import Path
 
@@ -21,14 +20,12 @@ from face_utils import (
     load_recognizer, recognize_faces, get_registered_persons, FACE_DATA_DIR,
 )
 from db import (
-    init_db, insert_detections, insert_detection_verifying, update_llm_result,
+    init_db, insert_detections,
     query_detections,
     get_watchlist, add_to_watchlist, remove_from_watchlist,
     check_watchlist, get_stats, clear_all_detections, get_distinct_values,
-    insert_llm_benchmark, get_llm_benchmarks, get_llm_benchmark_stats,
     update_detection_dwell, override_plate, mark_ground_truth, get_shift_report, record_exit,
 )
-from llm_verifier import verify_plate
 
 # ── Ollama auto-start ─────────────────────────────────────────────────────────
 def _ensure_ollama() -> None:
@@ -60,13 +57,6 @@ try:
 except Exception:
     pass
 
-# Pre-load llava-phi3 into RAM — eliminates cold-start latency on first plate
-try:
-    from llm_verifier import warmup as _llm_warmup
-    _llm_warmup()
-except Exception:
-    pass
-
 def _fire_webhook(plate: str, source: str) -> None:
     """POST watchlist-hit JSON to configured webhook URL (fire-and-forget)."""
     url = st.session_state.get("webhook_url", "").strip()
@@ -87,23 +77,23 @@ PLATES_DIR    = Path("./plate_crops")
 MODEL_COCO    = "./models/yolo11s.pt"
 VEHICLE_CLS   = {2: "Car", 3: "Motorcycle", 5: "Bus", 7: "Truck"}
 _CROP_PAD     = 8
-_SHARP_THRESH = 80.0
-_STATUS_RANK  = {"valid": 4, "corrected": 3, "rejected": 1}
+_SHARP_THRESH  = 80.0
+_STATUS_RANK   = {"valid": 4, "corrected": 3, "rejected": 1}
+_MIN_DISP_CONF = 0.40   # plates below 40% confidence hidden from dashboard
 
-# Module-level executor — survives across Streamlit reruns; LLM tasks persist beyond process_video
-_background_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-_PLATE_VEHICLE_OVERRIDE = {"KTW": "Tuk Tuk", "KMC": "Motorcycle"}
+_PLATE_VEHICLE_OVERRIDE = {"KMC": "Motorcycle"}  # tuk-tuk resolved via get_plate_category (KT prefix)
 # Civilian plates (K[A-Z][A-Z]) cannot belong to these YOLO classes
 _CIVILIAN_FORBIDDEN_LABELS = {"Motorcycle", "Tuk Tuk"}
 
 def _resolve_vehicle_type(plate_text: str, yolo_vehicle: str) -> str:
-    """Override YOLO vehicle label with plate-derived type for KTW/KMC prefixes.
-    Civilian plates cannot be motorcycles/tuk-tuks — correct YOLO misclassification."""
+    """Derive vehicle type from plate prefix. KT** = Tuk Tuk, KMC* = Motorcycle."""
     clean = re.sub(r'\s+', '', (plate_text or "").upper())
-    prefix3 = clean[:3]
-    if prefix3 in _PLATE_VEHICLE_OVERRIDE:
-        return _PLATE_VEHICLE_OVERRIDE[prefix3]
+    # Tuk-tuk: KT + 2 any letters (8-char plate)
+    if len(clean) >= 4 and clean[:2] == "KT" and clean[2].isalpha() and clean[3].isalpha():
+        return "Tuk Tuk"
+    if clean[:3] in _PLATE_VEHICLE_OVERRIDE:
+        return _PLATE_VEHICLE_OVERRIDE[clean[:3]]
     # Civilian plate on a YOLO-detected motorcycle → must be Car
     if clean.startswith("K") and yolo_vehicle in _CIVILIAN_FORBIDDEN_LABELS:
         return "Car"
@@ -302,6 +292,12 @@ def get_coco():
     from ultralytics import YOLO
     return YOLO(MODEL_COCO)
 
+_DETECTOR_LABEL_TO_VEHICLE = {
+    "car_plate":       "Car",
+    "tuktuk_plate":    "Tuk Tuk",
+    "motorbike_plate": "Motorcycle",
+}
+
 @st.cache_resource(show_spinner="Loading plate detector…")
 def get_alpr():
     from fast_alpr import ALPR
@@ -384,6 +380,14 @@ def preprocess_plate(crop_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+def upscale_crop_color(crop_bgr: np.ndarray) -> np.ndarray:
+    """Upscale to min 200px wide keeping color — for disk save and LLM input."""
+    h, w = crop_bgr.shape[:2]
+    if w == 0 or h == 0:
+        return crop_bgr
+    scale = max(200 / max(w, 1), 60 / max(h, 1), 2.0)
+    return cv2.resize(crop_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 
 def is_sharp(frame: np.ndarray, threshold: float = _SHARP_THRESH) -> bool:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -837,28 +841,17 @@ def _associate_vehicle(px1, py1, px2, py2, vehicles):
             best_d, best = d, VEHICLE_CLS.get(vcls, "Vehicle")
     return best
 
-def _crop_ok_for_llm(img: np.ndarray) -> bool:
-    """Mirror of llm_verifier._is_valid_crop — gate before inserting VERIFYING rows."""
-    if img is None or img.size == 0:
-        return False
-    h, w = img.shape[:2]
-    return w >= 40 and h >= 10 and 1.5 <= (w / h) <= 8.0
 
-
-def _verify_and_update(crop_bgr: np.ndarray, ocr_text: str, ocr_conf: float, detection_id: int) -> None:
-    """Background task: call LLM then update DB. Submitted via _background_executor."""
-    try:
-        llm_result = verify_plate(crop_bgr, ocr_text, ocr_conf)
-        try:
-            insert_llm_benchmark(llm_result)
-        except Exception:
-            pass
-        update_llm_result(detection_id, llm_result.get("plate_llm"), llm_result.get("error"))
-    except Exception as _exc:
-        try:
-            update_llm_result(detection_id, None, str(_exc))
-        except Exception:
-            pass
+def _plate_near_vehicle(px1, py1, px2, py2, vehicles, margin: int = 80) -> bool:
+    """Plate center must fall inside at least one vehicle bbox (expanded by margin px).
+    If no vehicles detected, pass through — COCO may have missed them at current conf."""
+    if not vehicles:
+        return True
+    pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
+    for vx1, vy1, vx2, vy2, _ in vehicles:
+        if vx1 - margin <= pcx <= vx2 + margin and vy1 - margin <= pcy <= vy2 + margin:
+            return True
+    return False
 
 
 # ── Detection functions ───────────────────────────────────────────────────────
@@ -877,6 +870,8 @@ def run_detection(img_rgb: np.ndarray, conf: float):
             continue
         bb = result.detection.bounding_box
         x1, y1, x2, y2 = int(bb.x1), int(bb.y1), int(bb.x2), int(bb.y2)
+        if not _plate_near_vehicle(x1, y1, x2, y2, vehicles):
+            continue  # plate outside all vehicle bboxes — discard
         cx1 = max(0, x1 - _CROP_PAD);  cy1 = max(0, y1 - _CROP_PAD)
         cx2 = min(w_bgr, x2 + _CROP_PAD); cy2 = min(h_bgr, y2 + _CROP_PAD)
         crop = bgr[cy1:cy2, cx1:cx2]
@@ -886,35 +881,11 @@ def run_detection(img_rgb: np.ndarray, conf: float):
         _rc = result.ocr.confidence
         alpr_conf = float(sum(_rc) / len(_rc) if isinstance(_rc, list) else (_rc or 0.0))
         vehicle = _associate_vehicle(x1, y1, x2, y2, vehicles)
+        crop_ocr = upscale_crop_color(crop)
         corrected, final_conf, n_subs, plate_status, raw_text, vote_info = _ensemble_ocr(
-            crop, alpr_text, alpr_conf
+            crop_ocr, alpr_text, alpr_conf
         )
-        # LLM referee — async: insert VERIFYING, fire background task, continue rendering
-        # Skip LLM for fully rejected plates (corrected=None) — nothing to verify
-        if vote_info.get("needs_llm", False) and corrected:
-            try:
-                _crop_pp = preprocess_plate(crop)
-                if _crop_ok_for_llm(crop):  # check raw — preprocessed may be deskewed/distorted
-                    _now_img = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    _fname_v = f"{uuid.uuid1()}.jpg"
-                    cv2.imwrite(str(PLATES_DIR / _fname_v), _crop_pp)  # save enhanced to disk
-                    _vrow = {"text": corrected, "score": final_conf,
-                             "vehicle_type": _resolve_vehicle_type(corrected, vehicle),
-                             "image_file": _fname_v, "timestamp": _now_img}
-                    _det_id = insert_detection_verifying(_vrow, source="image")
-                    _background_executor.submit(_verify_and_update, crop, corrected or alpr_text, final_conf, _det_id)  # raw color to LLM
-                    entry = {"text": corrected, "score": final_conf,
-                             "vehicle_type": _resolve_vehicle_type(corrected, vehicle),
-                             "image_file": _fname_v, "status": "VERIFYING", "n_subs": n_subs,
-                             "vote_info": vote_info}
-                    if vote_info.get("char_probs") and corrected:
-                        st.session_state[f"charprobs_{corrected}"] = vote_info["char_probs"]
-                    plates.append(entry)
-                    all_dets.append({**_vrow, "status": "VERIFYING", "n_subs": n_subs, "vote_info": vote_info})
-                    continue
-            except Exception:
-                pass  # fall through to normal (blocking) processing on error
-        if not corrected:
+        if not corrected or final_conf < _MIN_DISP_CONF:
             all_dets.append({"text": alpr_text, "score": alpr_conf,
                              "vehicle_type": _resolve_vehicle_type(alpr_text, vehicle), "status": "REJECTED", "image_file": ""})
             continue
@@ -931,12 +902,11 @@ def run_detection(img_rgb: np.ndarray, conf: float):
                              "vehicle_type": _resolve_vehicle_type(corrected, vehicle), "status": "REJECTED", "image_file": ""})
             continue
         fname = f"{uuid.uuid1()}.jpg"
-        cv2.imwrite(str(PLATES_DIR / fname), preprocess_plate(crop))
+        cv2.imwrite(str(PLATES_DIR / fname), upscale_crop_color(crop))
         shown_status = "SAVED" if plate_status == "valid" else plate_status.upper()
         entry = {"text": corrected, "score": final_conf, "vehicle_type": _resolve_vehicle_type(corrected, vehicle),
                  "image_file": fname, "status": shown_status, "n_subs": n_subs,
                  "vote_info": vote_info}
-        # Cache char_probs in session state for crop viewer heatmap
         if vote_info.get("char_probs") and corrected:
             st.session_state[f"charprobs_{corrected}"] = vote_info["char_probs"]
         plates.append(entry)
@@ -1028,6 +998,8 @@ def process_video(path: str, conf: float, progress_bar, status_ph, frame_ph, liv
                         continue
                     bb = result.detection.bounding_box
                     x1, y1, x2, y2 = int(bb.x1), int(bb.y1), int(bb.x2), int(bb.y2)
+                    if not _plate_near_vehicle(x1, y1, x2, y2, vehicles):
+                        continue  # plate outside all vehicle bboxes — discard
                     cx1 = max(0, x1 - _CROP_PAD);  cy1 = max(0, y1 - _CROP_PAD)
                     cx2 = min(w_f, x2 + _CROP_PAD); cy2 = min(h_f, y2 + _CROP_PAD)
                     crop = frame[cy1:cy2, cx1:cx2]
@@ -1037,46 +1009,15 @@ def process_video(path: str, conf: float, progress_bar, status_ph, frame_ph, liv
                     _rc = result.ocr.confidence
                     alpr_conf = float(sum(_rc) / len(_rc) if isinstance(_rc, list) else (_rc or 0.0))
                     vehicle = _associate_vehicle(x1, y1, x2, y2, vehicles)
+                    crop_ocr = upscale_crop_color(crop)
                     corrected, final_conf, n_subs, plate_status, raw_text, vote_info = _ensemble_ocr(
-                        crop, alpr_text, alpr_conf
+                        crop_ocr, alpr_text, alpr_conf
                     )
                     now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    # LLM referee — async: insert VERIFYING, fire background task, continue
-                    if vote_info.get("needs_llm", False) and corrected:
-                        try:
-                            _crop_pp = preprocess_plate(crop)
-                            if _crop_ok_for_llm(crop):  # check raw color crop
-                                _fname_v = f"{uuid.uuid1()}.jpg"
-                                cv2.imwrite(str(PLATES_DIR / _fname_v), _crop_pp)  # save enhanced
-                                _vrow = {"text": corrected, "score": round(final_conf, 4),
-                                         "vehicle_type": _resolve_vehicle_type(corrected, vehicle),
-                                         "image_file": _fname_v, "timestamp": now_s}
-                                _det_id = insert_detection_verifying(_vrow, source="video")
-                                _background_executor.submit(
-                                    _verify_and_update, crop, corrected or alpr_text, final_conf, _det_id  # raw color to LLM
-                                )
-                        except Exception:
-                            pass
-                        live_rows.append({
-                            "Time":       now_s,
-                            "Plate":      corrected,
-                            "Confidence": f"{final_conf:.0%}",
-                            "Vehicle":    _resolve_vehicle_type(corrected, vehicle),
-                            "Status":     "⏳ VERIFYING",
-                            "Voted":      "🔄 LLM",
-                        })
-                        live_ph.markdown(
-                            pd.DataFrame(live_rows).to_html(
-                                index=False, border=0, classes="", table_id="live-table"
-                            ),
-                            unsafe_allow_html=True,
-                        )
-                        continue
-
-                    if not corrected:
+                    if not corrected or final_conf < _MIN_DISP_CONF:
                         plate_boxes.append((x1, y1, x2, y2, alpr_text, False))
                         all_dets.append({"text": alpr_text, "score": alpr_conf,
-                                         "vehicle_type": _resolve_vehicle_type(alpr_text, vehicle), "status": "REJECTED", "image_file": ""})
+                                         "vehicle_type": _resolve_vehicle_type(raw_text, vehicle), "status": "REJECTED", "image_file": ""})
                         continue
                     if plate_status == "guessed":
                         # Display in live feed only — not saved to DB
@@ -1104,7 +1045,7 @@ def process_video(path: str, conf: float, progress_bar, status_ph, frame_ph, liv
                     if dup_status == "duplicate":
                         continue
                     fname = f"{uuid.uuid1()}.jpg"
-                    cv2.imwrite(str(PLATES_DIR / fname), preprocess_plate(crop))
+                    cv2.imwrite(str(PLATES_DIR / fname), upscale_crop_color(crop))
                     shown_status = "SAVED" if plate_status == "valid" else plate_status.upper()
                     row = {"text": best_text or corrected,
                            "score": round(best_conf or final_conf, 4),
@@ -1260,14 +1201,13 @@ with st.sidebar:
         st.rerun()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_img, tab_vid, tab_log, tab_rejection, tab_wl, tab_faces, tab_bench, tab_analytics = st.tabs([
+tab_img, tab_vid, tab_log, tab_rejection, tab_wl, tab_faces, tab_analytics = st.tabs([
     "📷  Image Analysis",
     "🎬  Video Analysis",
     "📋  Detection Log",
     "🔍  Rejection Audit",
     "🚨  Watchlist",
     "👤  Face Training",
-    "🤖  LLM Benchmark",
     "📊  Analytics",
 ])
 
@@ -1830,63 +1770,6 @@ with tab_faces:
                 else:
                     st.error(f"Training failed: {msg}")
 
-# ══ LLM BENCHMARK TAB ════════════════════════════════════════════════════════
-with tab_bench:
-    st.subheader("LLM Verification Benchmark — llava-phi3")
-    st.caption(
-        "Called when OCR engines disagree or combined confidence < 60%. "
-        "Compares ALPR ensemble output vs llava-phi3 via local Ollama."
-    )
-
-    _bstats = get_llm_benchmark_stats()
-    if _bstats["total"] == 0:
-        st.info("No LLM benchmark data yet. Run image or video analysis — LLM fires when engines disagree or confidence is low.")
-    else:
-        _bc1, _bc2, _bc3, _bc4, _bc5, _bc6 = st.columns(6)
-        _bc1.metric("Total Calls",     _bstats["total"])
-        _bc2.metric("Valid Plates",    _bstats["valid"],
-                    delta=f"{_bstats['valid']/_bstats['total']:.0%}" if _bstats["total"] else None)
-        _bc3.metric("Improved OCR",    _bstats["improved"],
-                    delta=f"{_bstats['improved']/_bstats['total']:.0%}" if _bstats["total"] else None)
-        _bc4.metric("Cache Hits",      _bstats["cached"],
-                    delta=f"{_bstats['cached']/_bstats['total']:.0%}" if _bstats["total"] else None)
-        _bc5.metric("Errors/Timeouts", _bstats["errors"])
-        _bc6.metric("Avg Latency",     f"{_bstats['avg_ms']} ms")
-
-        st.divider()
-
-        _bench_df = get_llm_benchmarks(limit=500)
-        if not _bench_df.empty:
-            # Friendly display
-            _bench_df["llm_valid"] = _bench_df["llm_valid"].map({1: "✅", 0: "❌"})
-            _bench_df["improved"]  = _bench_df["improved"].map({1: "⬆ Yes", 0: "—"})
-            _bench_df["ocr_conf"]  = _bench_df["ocr_conf"].apply(
-                lambda v: f"{float(v):.0%}" if v is not None else "—"
-            )
-            _bench_df["latency_ms"] = _bench_df["latency_ms"].apply(
-                lambda v: f"{int(v)} ms" if v is not None else "—"
-            )
-            _bench_df.rename(columns={
-                "timestamp":   "Time",
-                "ocr_input":   "OCR Input",
-                "ocr_conf":    "OCR Conf",
-                "plate_llm":   "LLM Plate",
-                "plate_used":  "Final Plate",
-                "llm_valid":   "LLM Valid",
-                "improved":    "Improved",
-                "latency_ms":  "Latency",
-                "error":       "Error",
-            }, inplace=True)
-            st.dataframe(_bench_df, use_container_width=True, hide_index=True, height=400)
-
-            _bdl1, _ = st.columns([1, 4])
-            _bdl1.download_button(
-                "⬇️ Download Benchmark CSV",
-                data=_bench_df.to_csv(index=False),
-                file_name="argus_llm_benchmark.csv",
-                mime="text/csv",
-                key="bench_csv_download",
-            )
 
 # ══ ANALYTICS TAB ════════════════════════════════════════════════════════════
 with tab_analytics:
@@ -1957,23 +1840,6 @@ with tab_analytics:
                 fig_tp.update_layout(plot_bgcolor="white", paper_bgcolor="white")
                 st.plotly_chart(fig_tp, use_container_width=True)
 
-            # LLM improvement rate over time
-            _llm_rows = _ac.execute(
-                "SELECT strftime('%Y-%m-%d', timestamp) AS day, "
-                "AVG(improved) * 100 AS improvement_rate "
-                "FROM llm_benchmarks GROUP BY day ORDER BY day"
-            ).fetchall()
-            if _llm_rows:
-                _llm_df = pd.DataFrame([dict(r) for r in _llm_rows])
-                fig_llm = px.line(_llm_df, x="day", y="improvement_rate",
-                                  title="LLM Improvement Rate Over Time (%)",
-                                  labels={"day": "Date", "improvement_rate": "Improvement Rate (%)"},
-                                  markers=True,
-                                  color_discrete_sequence=["#2563EB"])
-                fig_llm.update_layout(plot_bgcolor="white", paper_bgcolor="white")
-                st.plotly_chart(fig_llm, use_container_width=True)
-            else:
-                st.info("No LLM benchmark data yet for improvement rate chart.")
 
     except Exception as _ae:
         st.warning(f"Analytics unavailable: {_ae}")

@@ -1,0 +1,7 @@
+
+path: /Users/emmanuel/Downloads/License Plate Detection with YoloV8 and EasyOCR Code/
+train: data/square_plates
+val: data/square_plates
+
+names:
+  0: license_plate

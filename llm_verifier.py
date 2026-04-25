@@ -23,7 +23,7 @@ TIMEOUT_S       = 20
 _SYSTEM_PROMPT = (
     "You are a Kenyan license plate character extractor. "
     "Civilian plates: K[A-Z][A-Z] [0-9][0-9][0-9][A-Z] — 8 chars including space. Example: KDA 123B. "
-    "Tuk-tuk plates: KTW[A-Z] [0-9][0-9][0-9][A-Z] — 9 chars including space. Example: KTWA 123B. "
+    "Tuk-tuk plates: KT[A-Z][A-Z] [0-9][0-9][0-9][A-Z] — 9 chars including space. Example: KTWA 123B. "
     "Motorcycle plates: KMC[A-Z] [0-9][0-9][0-9][A-Z] — 9 chars including space. Example: KMCA 123B. "
     "Fix OCR errors by position: O↔0, I↔1, S↔5, B↔8, G↔6, T↔7, Z↔2. "
     "Output ONLY the plate string. Nothing else. No words. No sentences. "
@@ -86,7 +86,7 @@ def _parse_plate(response: str) -> Optional[str]:
     stripped = re.sub(r'[^A-Z0-9 ]', '', cleaned)
 
     # Primary: strict 8-char KTW/KMC regex
-    for pattern_8 in (r'\bKTW[A-Z]\s*\d{3}[A-Z]\b', r'\bKMC[A-Z]\s*\d{3}[A-Z]\b'):
+    for pattern_8 in (r'\bKT[A-Z]{2}\s*\d{3}[A-Z]\b', r'\bKMC[A-Z]\s*\d{3}[A-Z]\b'):
         m = re.search(pattern_8, stripped)
         if m:
             raw = re.sub(r'\s+', '', m.group())

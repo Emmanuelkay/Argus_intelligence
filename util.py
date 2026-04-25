@@ -4,15 +4,15 @@ import difflib
 # ---------------------------------------------------------------------------
 # Kenyan plate formats:
 #   Civilian:    K[A-Z]{2} \d{3}[A-Z]          e.g. KDA 123B   (7 chars)
-#   Tuk Tuk:     KTW[A-Z] \d{3}[A-Z]           e.g. KTWA 123B  (8 chars)
+#   Tuk Tuk:     KT[A-Z]{2} \d{3}[A-Z]         e.g. KTWA 123B  (8 chars, KT + any 2 letters)
 #   Motorcycle:  KMC[A-Z] \d{3}[A-Z]           e.g. KMCA 123B  (8 chars)
 # ---------------------------------------------------------------------------
 
 _KE_PLATE_RE   = re.compile(r'^K[A-Z]{2} \d{3}[A-Z]$')        # civilian  (with space)
-_KE_TUKTUK_RE  = re.compile(r'^KTW[A-Z] \d{3}[A-Z]$')         # tuk-tuk   (with space)
+_KE_TUKTUK_RE  = re.compile(r'^KT[A-Z]{2} \d{3}[A-Z]$')       # tuk-tuk   (with space)
 _KE_MOTO_RE    = re.compile(r'^KMC[A-Z] \d{3}[A-Z]$')         # motorcycle (with space)
 
-_SPECIAL_PREFIXES = {"KTW", "KMC"}   # 8-char plate prefixes
+_SPECIAL_PREFIXES = {"KT", "KMC"}   # 8-char plate prefixes (KT covers all tuk-tuk series)
 
 _LETTER_POSITIONS   = {0, 1, 2, 6}          # civilian 7-char letter positions (no space)
 _DIGIT_POSITIONS    = {3, 4, 5}             # civilian 7-char digit positions
@@ -53,7 +53,7 @@ _SUB_PENALTY = 0.06
 def get_plate_category(plate: str) -> str:
     """Return human-readable vehicle category from plate prefix."""
     clean = re.sub(r'\s+', '', (plate or "").upper())
-    if clean.startswith("KTW"):
+    if clean.startswith("KT") and len(clean) >= 4 and clean[2].isalpha() and clean[3].isalpha():
         return "Tuk Tuk"
     if clean.startswith("KMC"):
         return "Motorcycle"
@@ -263,15 +263,15 @@ def validate_kenyan_series(plate: str) -> dict:
 
     chars = list(clean)
     is_8char = len(clean) == 8
-    prefix3  = clean[:3]  # e.g. "KTW" or "KMC" or "KDA"
+    prefix2  = clean[:2]  # "KT" = tuk-tuk, "KM" = motorcycle prefix start
 
     # Rule A: first char must be 'K'
     if chars[0] != 'K':
         flags.append("not_civilian")
         valid = False
 
-    # Rule B: series constraint — only for civilian plates (not KTW/KMC)
-    # KTW/KMC series letter (pos 3) is much further along — no constraint applied
+    # Rule B: series constraint — only for civilian plates (not KT.../KMC)
+    # Tuk-tuk (KT**) and motorcycle (KMC*) series letters are unconstrained
     if not is_8char:
         if len(chars) > 1 and chars[1].isalpha() and chars[1] > 'D':
             flags.append("series_beyond_D")
