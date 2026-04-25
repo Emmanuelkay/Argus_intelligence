@@ -1,28 +1,29 @@
 # Core UI
-streamlit>=1.37.0
+streamlit>=1.56.0
 
 # Vehicle & plate detection
-ultralytics>=8.0.0
+ultralytics>=8.4.0
 fast-alpr>=0.4.0
-onnxruntime>=1.18.0
+onnxruntime>=1.25.0
 
 # OCR engines
+fast-plate-ocr>=1.1.0
 paddlepaddle>=3.0.0
-paddleocr>=3.0.0
+paddleocr>=3.5.0
 
-# Image processing / deblur
-opencv-contrib-python>=4.9.0
-super-image>=0.2.0
+# Image processing
+opencv-contrib-python>=4.10.0
 torch>=2.0.0
-Pillow>=10.0.0
+torchvision>=0.15.0
+Pillow>=12.0.0
 
 # Utilities
-numpy>=1.24.0
-pandas>=2.0.0
+numpy>=2.0.0
+pandas>=3.0.0
 requests>=2.28.0
 
 # Analytics
-plotly>=5.0.0
+plotly>=6.0.0
 
 # PDF reports
 fpdf2>=2.7.0
@@ -31,3 +32,6 @@ fpdf2>=2.7.0
 fastapi>=0.100.0
 uvicorn>=0.23.0
 pydantic>=2.0.0
+
+# YouTube video download
+yt-dlp>=2026.3.17
