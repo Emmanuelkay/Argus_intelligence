@@ -34,12 +34,11 @@ _USER_PROMPT = "Extract the license plate number."
 
 _OPTIONS = {
     "temperature":    0.0,
-    "num_predict":    10,
+    "num_predict":    20,
     "num_ctx":        512,
     "top_k":          1,
     "repeat_penalty": 1.5,
-    "stop":           ["\n", " is", "The", "the", "plate", "Plate", "sorry", "Sorry",
-                       "I ", "cannot", "image", "shows", "reads", "says"],
+    "stop":           ["\n", "sorry", "Sorry", "I ", "cannot", "None", "none"],
 }
 
 # Chatter words that mean the model failed — treat as None

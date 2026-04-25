@@ -894,15 +894,15 @@ def run_detection(img_rgb: np.ndarray, conf: float):
         if vote_info.get("needs_llm", False) and corrected:
             try:
                 _crop_pp = preprocess_plate(crop)
-                if _crop_ok_for_llm(_crop_pp):
+                if _crop_ok_for_llm(crop):  # check raw — preprocessed may be deskewed/distorted
                     _now_img = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     _fname_v = f"{uuid.uuid1()}.jpg"
-                    cv2.imwrite(str(PLATES_DIR / _fname_v), _crop_pp)
+                    cv2.imwrite(str(PLATES_DIR / _fname_v), _crop_pp)  # save enhanced to disk
                     _vrow = {"text": corrected, "score": final_conf,
                              "vehicle_type": _resolve_vehicle_type(corrected, vehicle),
                              "image_file": _fname_v, "timestamp": _now_img}
                     _det_id = insert_detection_verifying(_vrow, source="image")
-                    _background_executor.submit(_verify_and_update, _crop_pp, corrected or alpr_text, final_conf, _det_id)
+                    _background_executor.submit(_verify_and_update, crop, corrected or alpr_text, final_conf, _det_id)  # raw color to LLM
                     entry = {"text": corrected, "score": final_conf,
                              "vehicle_type": _resolve_vehicle_type(corrected, vehicle),
                              "image_file": _fname_v, "status": "VERIFYING", "n_subs": n_subs,
@@ -1045,15 +1045,15 @@ def process_video(path: str, conf: float, progress_bar, status_ph, frame_ph, liv
                     if vote_info.get("needs_llm", False) and corrected:
                         try:
                             _crop_pp = preprocess_plate(crop)
-                            if _crop_ok_for_llm(_crop_pp):
+                            if _crop_ok_for_llm(crop):  # check raw color crop
                                 _fname_v = f"{uuid.uuid1()}.jpg"
-                                cv2.imwrite(str(PLATES_DIR / _fname_v), _crop_pp)
+                                cv2.imwrite(str(PLATES_DIR / _fname_v), _crop_pp)  # save enhanced
                                 _vrow = {"text": corrected, "score": round(final_conf, 4),
                                          "vehicle_type": _resolve_vehicle_type(corrected, vehicle),
                                          "image_file": _fname_v, "timestamp": now_s}
                                 _det_id = insert_detection_verifying(_vrow, source="video")
                                 _background_executor.submit(
-                                    _verify_and_update, _crop_pp, corrected or alpr_text, final_conf, _det_id
+                                    _verify_and_update, crop, corrected or alpr_text, final_conf, _det_id  # raw color to LLM
                                 )
                         except Exception:
                             pass
