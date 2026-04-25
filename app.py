@@ -446,6 +446,9 @@ def _ocr_fast_plate(crop_bgr: np.ndarray) -> tuple[str, float, list | None]:
             text = raw_t[:3] + " " + raw_t[3:]
         else:
             text = raw_t
+        # Trim padding tokens — model outputs fixed-length, clip to actual plate length
+        if char_probs:
+            char_probs = char_probs[:len(raw_t)]
         return text, conf, char_probs
     except Exception:
         return "", 0.0, None
@@ -491,20 +494,15 @@ def _plate_heatmap_html(plate: str, char_probs: list[float]) -> str:
     return "".join(spans)
 
 
-def _render_vote_panel(vote_info: dict) -> str:
+def _render_vote_panel(vote_info: dict, skip_crop: bool = False) -> str:
     """Return HTML string for the ensemble vote board."""
     # ── Fast-path: simplified badge, no engine table ──────────────────────────
     if vote_info.get("fast_path"):
         final    = vote_info.get("final_plate", "—")
-        crop_b64 = vote_info.get("crop_b64", "")
         conf_val = vote_info.get("combined_conf", 0.0)
-        crop_html = ""
-        if crop_b64:
-            crop_html = f'<img src="data:image/jpeg;base64,{crop_b64}" style="height:52px;border-radius:6px;border:2px solid #E2E8F0;object-fit:contain;background:#000;max-width:200px;vertical-align:middle;margin-right:10px;" />'
         return f"""
     <div style="background:#F0FDF4;border:1.5px solid #86EFAC;border-radius:10px;
                 padding:10px 16px;margin:6px 0;display:flex;align-items:center;gap:12px;">
-      {crop_html}
       <span style="font-family:monospace;font-size:1.2rem;font-weight:900;color:#166534;">
         {final}</span>
       <span style="font-size:0.85rem;color:#166534;">{conf_val:.0%}</span>
@@ -568,17 +566,7 @@ def _render_vote_panel(vote_info: dict) -> str:
           </div>
         </div>"""
 
-    crop_html = ""
-    if crop_b64:
-        crop_html = f"""
-        <div style="padding:10px 14px 4px;display:flex;align-items:center;gap:12px;">
-          <img src="data:image/jpeg;base64,{crop_b64}"
-               style="height:56px;border-radius:6px;border:2px solid #E2E8F0;
-                      box-shadow:0 2px 6px rgba(0,0,0,0.12);object-fit:contain;
-                      background:#000;max-width:220px;" />
-          <span style="font-family:monospace;font-size:1.25rem;font-weight:900;
-                       color:#1E3A5F;letter-spacing:0.1em;">{final}</span>
-        </div>"""
+    crop_html = ""  # crop shown via st.image() in the expander, not inline HTML
 
     # ── Char-probs heatmap ────────────────────────────────────────────────────
     char_probs  = vote_info.get("char_probs")
@@ -586,8 +574,8 @@ def _render_vote_panel(vote_info: dict) -> str:
     if char_probs:
         plate_chars = list(re.sub(r"\s", "", final))
         boxes = []
-        for idx, prob in enumerate(char_probs):
-            ch = plate_chars[idx] if idx < len(plate_chars) else "?"
+        for idx, prob in enumerate(char_probs[:len(plate_chars)]):
+            ch = plate_chars[idx]
             if prob > 0.9:
                 bg, fg = "#DCFCE7", "#166534"
             elif prob >= 0.7:
@@ -638,6 +626,24 @@ def _render_vote_panel(vote_info: dict) -> str:
       {vote_badge}
       {heatmap_html}
     </div>"""
+
+
+def _show_vote_expander(vote_info: dict, label: str) -> None:
+    """Render a collapsible ensemble vote expander using native st.image for the crop."""
+    import base64 as _b64m
+    with st.expander(f"🔍 OCR Ensemble — {label}"):
+        crop_b64 = vote_info.get("crop_b64", "")
+        if crop_b64:
+            try:
+                crop_bytes = _b64m.b64decode(crop_b64)
+                crop_arr   = np.frombuffer(crop_bytes, np.uint8)
+                crop_bgr   = cv2.imdecode(crop_arr, cv2.IMREAD_COLOR)
+                if crop_bgr is not None:
+                    st.image(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB),
+                             caption=label, width=220)
+            except Exception:
+                pass
+        st.markdown(_render_vote_panel(vote_info), unsafe_allow_html=True)
 
 
 def _timed_ocr(fn, *args) -> tuple[str, float, int]:
@@ -1065,8 +1071,6 @@ def process_video(path: str, conf: float, progress_bar, status_ph, frame_ph, liv
                     _feed_html = pd.DataFrame(live_rows).to_html(
                         index=False, border=0, classes="", table_id="live-table"
                     )
-                    if vote_info.get("voted") or vote_info.get("engines"):
-                        _feed_html += _render_vote_panel(vote_info)
                     live_ph.markdown(_feed_html, unsafe_allow_html=True)
 
                 annotated = _draw_annotations(frame, vehicles, plate_boxes)
@@ -1266,13 +1270,12 @@ with tab_img:
                         unsafe_allow_html=True,
                     )
 
-            # Vote board — one panel per detection, full width
-            st.markdown("#### OCR Ensemble Detail")
+            # Vote board — collapsible per detection
             for p in plates:
                 vi = p.get("vote_info")
                 if vi:
                     try:
-                        st.markdown(_render_vote_panel(vi), unsafe_allow_html=True)
+                        _show_vote_expander(vi, p.get("text", "—"))
                     except Exception:
                         pass
         else:
@@ -1289,11 +1292,12 @@ with tab_vid:
     st.subheader("Video Analysis")
 
     # ── Source selection ──────────────────────────────────────────────────────
-    _vid_src = st.radio("Video source", ["📁 File Upload", "📡 RTSP / IP Camera"],
+    _vid_src = st.radio("Video source", ["📁 File Upload", "📡 RTSP / IP Camera", "▶️ YouTube URL"],
                         horizontal=True, key="vid_source_radio")
 
-    vid_file  = None
-    rtsp_url  = ""
+    vid_file   = None
+    rtsp_url   = ""
+    yt_url     = ""
     _live_feed = False
 
     if _vid_src == "📁 File Upload":
@@ -1301,6 +1305,15 @@ with tab_vid:
             "Upload a video", type=["mp4", "mov", "avi", "mkv", "m4v"],
             label_visibility="collapsed", key="vid_upload",
         )
+    elif _vid_src == "▶️ YouTube URL":
+        st.markdown("##### ▶️ YouTube")
+        yt_url = st.text_input(
+            "YouTube URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+            key="yt_url_input",
+        )
+        if yt_url:
+            st.info("Video will be downloaded to a temp file before analysis.")
     else:
         st.markdown("##### 📡 RTSP / IP Camera")
         rtsp_url = st.text_input(
@@ -1313,8 +1326,9 @@ with tab_vid:
             st.info(f"Stream: `{rtsp_url}`")
 
     # Determine video path (file or RTSP)
-    _use_rtsp   = bool(rtsp_url and _vid_src == "📡 RTSP / IP Camera")
-    _can_analyse = vid_file is not None or _use_rtsp
+    _use_rtsp    = bool(rtsp_url and _vid_src == "📡 RTSP / IP Camera")
+    _use_yt      = bool(yt_url and _vid_src == "▶️ YouTube URL")
+    _can_analyse = vid_file is not None or _use_rtsp or _use_yt
 
     if vid_file:
         st.video(vid_file)
@@ -1327,6 +1341,26 @@ with tab_vid:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                     tmp.write(vid_file.read())
                     tmp_path = tmp.name
+            elif _use_yt:
+                with st.spinner("Downloading YouTube video…"):
+                    try:
+                        import yt_dlp
+                        _yt_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                        _yt_tmp.close()
+                        ydl_opts = {
+                            "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
+                            "outtmpl": _yt_tmp.name,
+                            "quiet": True,
+                            "no_warnings": True,
+                            "merge_output_format": "mp4",
+                        }
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([yt_url])
+                        tmp_path = _yt_tmp.name
+                        st.success("Download complete — starting analysis…")
+                    except Exception as _yt_err:
+                        st.error(f"YouTube download failed: {_yt_err}")
+                        st.stop()
             else:
                 tmp_path = rtsp_url  # cv2.VideoCapture accepts RTSP URLs directly
 
@@ -1390,15 +1424,13 @@ with tab_vid:
                         _cat_label = f" · {_cat}" if _cat not in ("Civilian", "Unknown") else ""
                         st.caption(f'{d["status"]} · {d["score"]:.0%} · {d["vehicle_type"]}{_cat_label}')
 
-                # Vote boards for all saved plates
+                # Vote boards — collapsible per detection
                 voted_dets = [d for d in dets if d.get("vote_info")]
-                if voted_dets:
-                    st.markdown("#### OCR Ensemble Detail")
-                    for d in voted_dets:
-                        try:
-                            st.markdown(_render_vote_panel(d["vote_info"]), unsafe_allow_html=True)
-                        except Exception:
-                            pass
+                for d in voted_dets:
+                    try:
+                        _show_vote_expander(d["vote_info"], d.get("text", "—"))
+                    except Exception:
+                        pass
 
 # ══ LOG TAB ══════════════════════════════════════════════════════════════════
 with tab_log:
